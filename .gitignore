@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# macOS system files
+.DS_Store
+
+# Plugin runtime data (contains local paths and user state)
+data.json
+
+# Logs
+*.log

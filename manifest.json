@@ -1,0 +1,10 @@
+{
+  "id": "screen-time-dashboard-bridge",
+  "name": "ScreenTime Dashboard Bridge",
+  "version": "0.1.2",
+  "minAppVersion": "1.5.0",
+  "description": "Bridge Obsidian Daily Notes with iPhone ScreenTime Dashboard.",
+  "author": "Peng",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

@@ -16,10 +16,21 @@ This plugin bridges Obsidian Daily Notes and the local ScreenTime Dashboard proj
 ## Development
 ```bash
 npm install
+npm run test
 npm run build
 ```
 
 This generates `main.js` required by Obsidian.
+
+## Dashboard launch identity
+
+- Canonical Dashboard path: `/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard`.
+- Version 0.1.3 migrates the retired path only when that path is missing and the canonical checkout contains both `start.py` and `stop.py`.
+- A valid custom path is never overwritten.
+- After launch, the plugin checks `GET /api/system/runtime`. It opens the browser only when the app id, real project path, and launch mode match the configured checkout.
+- If another program owns ports 8000/5173, the Dashboard refuses to terminate that unknown process.
+
+For local deployment, copy `main.js`, `manifest.json`, and `styles.css` into the Vault plugin directory and keep its `data.json` unchanged. Reload the plugin in Obsidian after copying.
 
 ## Installation / 安装
 
@@ -30,6 +41,8 @@ This generates `main.js` required by Obsidian.
 4. Click "Add Plugin" and enable "ScreenTime Dashboard Bridge" in Community Plugins.
 
 > Please refer to the [BRAT developer guide](https://tfthacker.com/brat-developers) for the latest workflow details.
+
+After a new release is pushed to GitHub, use BRAT's manual update action to install the tracked `manifest.json`/`main.js` version.
 
 ### 通过 BRAT 安装（推荐用于测试版）
 1. 在 Obsidian 中安装 [BRAT](https://github.com/TfTHacker/obsidian42-brat) 插件。

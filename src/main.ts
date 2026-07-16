@@ -12,6 +12,12 @@ import {
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import {
+  CANONICAL_DASHBOARD_PATH,
+  LEGACY_DASHBOARD_PATH,
+  migrateDashboardPath,
+  validateRuntimeIdentity,
+} from "./runtime.mjs";
 
 type StartMode = "dev" | "prod";
 
@@ -24,7 +30,7 @@ interface BridgeSettings {
 }
 
 const DEFAULT_SETTINGS: BridgeSettings = {
-  dashboardPath: "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard",
+  dashboardPath: CANONICAL_DASHBOARD_PATH,
   startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
@@ -145,6 +151,15 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const [legacyExists, canonicalValid] = await Promise.all([
+      this.pathExists(LEGACY_DASHBOARD_PATH),
+      this.dashboardProjectValid(CANONICAL_DASHBOARD_PATH),
+    ]);
+    const migrated = migrateDashboardPath(this.settings.dashboardPath, { legacyExists, canonicalValid });
+    if (migrated !== this.settings.dashboardPath) {
+      this.settings.dashboardPath = migrated;
+      await this.saveData(this.settings);
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -160,6 +175,33 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
       throw new Error("This plugin only supports FileSystemAdapter");
     }
     return adapter.getBasePath();
+  }
+
+  private async pathExists(targetPath: string): Promise<boolean> {
+    try {
+      await fs.access(targetPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async dashboardProjectValid(targetPath: string): Promise<boolean> {
+    const root = String(targetPath || "").trim();
+    if (!root) return false;
+    return (await Promise.all([
+      this.pathExists(root),
+      this.pathExists(path.join(root, "start.py")),
+      this.pathExists(path.join(root, "stop.py")),
+    ])).every(Boolean);
+  }
+
+  private async requireDashboardProject(): Promise<string> {
+    const configured = String(this.settings.dashboardPath || "").trim();
+    if (!(await this.dashboardProjectValid(configured))) {
+      throw new Error(`Dashboard 项目路径无效：${configured || "未配置"}（需要 start.py 与 stop.py）`);
+    }
+    return fs.realpath(configured);
   }
 
   private async readDailyConfig(): Promise<DailyConfig> {
@@ -303,12 +345,28 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
 
   async startDashboard(): Promise<void> {
     try {
-      const startScript = path.join(this.settings.dashboardPath, "start.py");
+      const expectedRoot = await this.requireDashboardProject();
+      const startScript = path.join(expectedRoot, "start.py");
       await this.runPython([startScript, "--mode", this.settings.startMode, "--no-browser"]);
       const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 30000);
       if (this.settings.startMode === "dev") {
         await this.waitHttpReady(FRONTEND_URL_DEV, 30000);
+      }
+      const runtimeResponse = await requestUrl({
+        url: `${BACKEND_URL}/api/system/runtime`,
+        method: "GET",
+        throw: false,
+      });
+      if (runtimeResponse.status < 200 || runtimeResponse.status >= 300) {
+        throw new Error(`无法验证 Dashboard 运行身份（HTTP ${runtimeResponse.status}）`);
+      }
+      const runtimeValidation = validateRuntimeIdentity(runtimeResponse.json, {
+        path: expectedRoot,
+        mode: this.settings.startMode,
+      });
+      if (!runtimeValidation.ok) {
+        throw new Error(runtimeValidation.message);
       }
       await this.pushConfigToDashboard(true);
       if (this.settings.openBrowserOnStart) {
@@ -348,7 +406,7 @@ class BridgeSettingTab extends PluginSettingTab {
       .setDesc("start.py 与 stop.py 所在目录")
       .addText((text) =>
         text
-          .setPlaceholder("/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard")
+          .setPlaceholder(CANONICAL_DASHBOARD_PATH)
           .setValue(this.plugin.settings.dashboardPath)
           .onChange(async (value) => {
             this.plugin.settings.dashboardPath = value.trim();

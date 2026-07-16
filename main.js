@@ -36,9 +36,46 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var import_node_child_process = require("node:child_process");
 var import_node_fs = require("node:fs");
+var import_node_path2 = __toESM(require("node:path"), 1);
+
+// src/runtime.mjs
 var import_node_path = __toESM(require("node:path"), 1);
+var APP_ID = "peng.screentime-dashboard";
+var CANONICAL_DASHBOARD_PATH = "/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard";
+var LEGACY_DASHBOARD_PATH = "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard";
+function migrateDashboardPath(currentPath, { legacyExists, canonicalValid }) {
+  const current = String(currentPath || "").trim();
+  if (current === LEGACY_DASHBOARD_PATH && !legacyExists && canonicalValid) {
+    return CANONICAL_DASHBOARD_PATH;
+  }
+  return current || CANONICAL_DASHBOARD_PATH;
+}
+function validateRuntimeIdentity(runtime, expected) {
+  if (!runtime || runtime.app_id !== APP_ID) {
+    return { ok: false, message: "\u5F53\u524D\u7AEF\u53E3\u4E0D\u662F ScreenTime Dashboard\uFF0C\u5DF2\u62D2\u7EDD\u6253\u5F00\u6D4F\u89C8\u5668\u3002" };
+  }
+  const expectedRoot = import_node_path.default.resolve(String(expected?.path || ""));
+  const actualRoot = import_node_path.default.resolve(String(runtime.project_root || ""));
+  if (!expectedRoot || actualRoot !== expectedRoot) {
+    return {
+      ok: false,
+      message: `\u5B9E\u9645\u8FD0\u884C\u76EE\u5F55\u4E0E\u63D2\u4EF6\u914D\u7F6E\u4E0D\u4E00\u81F4\uFF1A${actualRoot || "\u672A\u77E5"}\uFF08\u9884\u671F ${expectedRoot || "\u672A\u77E5"}\uFF09`
+    };
+  }
+  const expectedMode = String(expected?.mode || "");
+  const actualMode = String(runtime.mode || "");
+  if (actualMode !== expectedMode) {
+    return {
+      ok: false,
+      message: `Dashboard \u542F\u52A8\u6A21\u5F0F\u4E0D\u4E00\u81F4\uFF1A${actualMode || "\u672A\u77E5"}\uFF08\u9884\u671F ${expectedMode || "\u672A\u77E5"}\uFF09`
+    };
+  }
+  return { ok: true, message: "" };
+}
+
+// src/main.ts
 var DEFAULT_SETTINGS = {
-  dashboardPath: "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard",
+  dashboardPath: CANONICAL_DASHBOARD_PATH,
   startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
@@ -138,6 +175,15 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const [legacyExists, canonicalValid] = await Promise.all([
+      this.pathExists(LEGACY_DASHBOARD_PATH),
+      this.dashboardProjectValid(CANONICAL_DASHBOARD_PATH)
+    ]);
+    const migrated = migrateDashboardPath(this.settings.dashboardPath, { legacyExists, canonicalValid });
+    if (migrated !== this.settings.dashboardPath) {
+      this.settings.dashboardPath = migrated;
+      await this.saveData(this.settings);
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -152,9 +198,33 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     }
     return adapter.getBasePath();
   }
+  async pathExists(targetPath) {
+    try {
+      await import_node_fs.promises.access(targetPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async dashboardProjectValid(targetPath) {
+    const root = String(targetPath || "").trim();
+    if (!root) return false;
+    return (await Promise.all([
+      this.pathExists(root),
+      this.pathExists(import_node_path2.default.join(root, "start.py")),
+      this.pathExists(import_node_path2.default.join(root, "stop.py"))
+    ])).every(Boolean);
+  }
+  async requireDashboardProject() {
+    const configured = String(this.settings.dashboardPath || "").trim();
+    if (!await this.dashboardProjectValid(configured)) {
+      throw new Error(`Dashboard \u9879\u76EE\u8DEF\u5F84\u65E0\u6548\uFF1A${configured || "\u672A\u914D\u7F6E"}\uFF08\u9700\u8981 start.py \u4E0E stop.py\uFF09`);
+    }
+    return import_node_fs.promises.realpath(configured);
+  }
   async readDailyConfig() {
     const basePath = this.getVaultBasePath();
-    const configPath = import_node_path.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
+    const configPath = import_node_path2.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
     try {
       const raw = await import_node_fs.promises.readFile(configPath, "utf-8");
       const json = JSON.parse(raw);
@@ -169,7 +239,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   getDailyConfigPath() {
     const basePath = this.getVaultBasePath();
-    return import_node_path.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
+    return import_node_path2.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
   }
   async syncDailyConfigWhenChanged() {
     if (!this.settings.autoSyncConfig) return;
@@ -280,12 +350,28 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async startDashboard() {
     try {
-      const startScript = import_node_path.default.join(this.settings.dashboardPath, "start.py");
+      const expectedRoot = await this.requireDashboardProject();
+      const startScript = import_node_path2.default.join(expectedRoot, "start.py");
       await this.runPython([startScript, "--mode", this.settings.startMode, "--no-browser"]);
       const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 3e4);
       if (this.settings.startMode === "dev") {
         await this.waitHttpReady(FRONTEND_URL_DEV, 3e4);
+      }
+      const runtimeResponse = await (0, import_obsidian.requestUrl)({
+        url: `${BACKEND_URL}/api/system/runtime`,
+        method: "GET",
+        throw: false
+      });
+      if (runtimeResponse.status < 200 || runtimeResponse.status >= 300) {
+        throw new Error(`\u65E0\u6CD5\u9A8C\u8BC1 Dashboard \u8FD0\u884C\u8EAB\u4EFD\uFF08HTTP ${runtimeResponse.status}\uFF09`);
+      }
+      const runtimeValidation = validateRuntimeIdentity(runtimeResponse.json, {
+        path: expectedRoot,
+        mode: this.settings.startMode
+      });
+      if (!runtimeValidation.ok) {
+        throw new Error(runtimeValidation.message);
       }
       await this.pushConfigToDashboard(true);
       if (this.settings.openBrowserOnStart) {
@@ -298,7 +384,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async stopDashboard() {
     try {
-      const stopScript = import_node_path.default.join(this.settings.dashboardPath, "stop.py");
+      const stopScript = import_node_path2.default.join(this.settings.dashboardPath, "stop.py");
       await this.runPython([stopScript]);
       new import_obsidian.Notice("ScreenTime Dashboard \u5DF2\u505C\u6B62");
     } catch (err) {
@@ -315,7 +401,7 @@ var BridgeSettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Dashboard \u9879\u76EE\u8DEF\u5F84").setDesc("start.py \u4E0E stop.py \u6240\u5728\u76EE\u5F55").addText(
-      (text) => text.setPlaceholder("/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard").setValue(this.plugin.settings.dashboardPath).onChange(async (value) => {
+      (text) => text.setPlaceholder(CANONICAL_DASHBOARD_PATH).setValue(this.plugin.settings.dashboardPath).onChange(async (value) => {
         this.plugin.settings.dashboardPath = value.trim();
         await this.plugin.saveSettings();
       })

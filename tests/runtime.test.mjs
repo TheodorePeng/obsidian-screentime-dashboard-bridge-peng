@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 
 import {
   APP_ID,
@@ -60,4 +61,17 @@ test('plugin release files and source declare version 0.1.3', () => {
   assert.match(source, /\/api\/system\/runtime/)
   assert.match(source, /validateRuntimeIdentity/)
   assert.match(source, /start\.py 与 stop\.py/)
+})
+
+test('release attaches BRAT-required assets (main.js, manifest.json, styles.css)', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'))
+  const version = manifest.version
+  const repo = 'TheodorePeng/obsidian-screentime-dashboard-bridge-peng'
+  const out = execFileSync(
+    'gh',
+    ['release', 'view', version, '--repo', repo, '--json', 'assets'],
+    { encoding: 'utf8' }
+  )
+  const names = JSON.parse(out).assets.map(a => a.name).sort()
+  assert.deepEqual(names, ['main.js', 'manifest.json', 'styles.css'])
 })

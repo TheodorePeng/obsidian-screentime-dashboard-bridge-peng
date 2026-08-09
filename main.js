@@ -43,6 +43,28 @@ var import_node_path = __toESM(require("node:path"), 1);
 var APP_ID = "peng.screentime-dashboard";
 var CANONICAL_DASHBOARD_PATH = "/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard";
 var LEGACY_DASHBOARD_PATH = "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard";
+var CONFIG_SYNC_HEARTBEAT_MS = 15e3;
+function resolveDashboardConfigSync({
+  autoSync = true,
+  currentMtimeMs = null,
+  previousMtimeMs = null,
+  lastAttemptAtMs = 0,
+  nowMs = Date.now(),
+  heartbeatMs = CONFIG_SYNC_HEARTBEAT_MS
+} = {}) {
+  const currentMtime = Number(currentMtimeMs);
+  const previousMtime = Number(previousMtimeMs);
+  const hasCurrentMtime = currentMtimeMs !== null && Number.isFinite(currentMtime);
+  const hasPreviousMtime = previousMtimeMs !== null && Number.isFinite(previousMtime);
+  const nextMtimeMs = hasCurrentMtime ? currentMtime : hasPreviousMtime ? previousMtime : null;
+  const configChanged = hasCurrentMtime && (!hasPreviousMtime || currentMtime !== previousMtime);
+  const elapsedMs = Math.max(0, Number(nowMs) - Math.max(0, Number(lastAttemptAtMs) || 0));
+  const heartbeatDue = elapsedMs >= Math.max(1, Number(heartbeatMs) || CONFIG_SYNC_HEARTBEAT_MS);
+  return {
+    shouldPush: Boolean(autoSync) && (configChanged || heartbeatDue),
+    nextMtimeMs
+  };
+}
 function migrateDashboardPath(currentPath, { legacyExists, canonicalValid }) {
   const current = String(currentPath || "").trim();
   if (current === LEGACY_DASHBOARD_PATH && !legacyExists && canonicalValid) {
@@ -121,6 +143,8 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
     this.dailyConfigMtimeMs = null;
+    this.lastConfigPushAttemptAtMs = 0;
+    this.configPushInFlight = false;
   }
   async onload() {
     await this.loadSettings();
@@ -243,18 +267,24 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async syncDailyConfigWhenChanged() {
     if (!this.settings.autoSyncConfig) return;
+    let currentMtimeMs = null;
     try {
       const stats = await import_node_fs.promises.stat(this.getDailyConfigPath());
-      const mtime = Number(stats.mtimeMs || 0);
-      if (this.dailyConfigMtimeMs === null) {
-        this.dailyConfigMtimeMs = mtime;
-        return;
-      }
-      if (mtime !== this.dailyConfigMtimeMs) {
-        this.dailyConfigMtimeMs = mtime;
-        await this.pushConfigToDashboard(true);
-      }
+      currentMtimeMs = Number(stats.mtimeMs || 0);
     } catch {
+      currentMtimeMs = null;
+    }
+    const decision = resolveDashboardConfigSync({
+      autoSync: this.settings.autoSyncConfig,
+      currentMtimeMs,
+      previousMtimeMs: this.dailyConfigMtimeMs,
+      lastAttemptAtMs: this.lastConfigPushAttemptAtMs,
+      nowMs: Date.now(),
+      heartbeatMs: CONFIG_SYNC_HEARTBEAT_MS
+    });
+    this.dailyConfigMtimeMs = decision.nextMtimeMs;
+    if (decision.shouldPush) {
+      await this.pushConfigToDashboard(true);
     }
   }
   async ensureFolderExists(folderPath) {
@@ -335,17 +365,28 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     };
   }
   async pushConfigToDashboard(silent = false) {
+    if (this.configPushInFlight) return false;
+    this.configPushInFlight = true;
+    this.lastConfigPushAttemptAtMs = Date.now();
     try {
       const payload = await this.buildDashboardConfigPayload();
-      await (0, import_obsidian.requestUrl)({
+      const response = await (0, import_obsidian.requestUrl)({
         url: `${BACKEND_URL}/api/obsidian/config`,
         method: "PUT",
         body: JSON.stringify(payload),
-        headers: { "Content-Type": "application/json" }
+        headers: { "Content-Type": "application/json" },
+        throw: false
       });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`HTTP ${response.status}`);
+      }
       if (!silent) new import_obsidian.Notice("ScreenTime Dashboard \u914D\u7F6E\u5DF2\u540C\u6B65\u5230\u540E\u7AEF");
+      return true;
     } catch (err) {
       if (!silent) new import_obsidian.Notice(`\u540C\u6B65\u914D\u7F6E\u5931\u8D25: ${String(err)}`);
+      return false;
+    } finally {
+      this.configPushInFlight = false;
     }
   }
   async startDashboard() {

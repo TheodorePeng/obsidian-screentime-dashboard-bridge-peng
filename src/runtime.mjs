@@ -3,6 +3,29 @@ import path from 'node:path'
 export const APP_ID = 'peng.screentime-dashboard'
 export const CANONICAL_DASHBOARD_PATH = '/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard'
 export const LEGACY_DASHBOARD_PATH = '/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard'
+export const CONFIG_SYNC_HEARTBEAT_MS = 15_000
+
+export function resolveDashboardConfigSync({
+  autoSync = true,
+  currentMtimeMs = null,
+  previousMtimeMs = null,
+  lastAttemptAtMs = 0,
+  nowMs = Date.now(),
+  heartbeatMs = CONFIG_SYNC_HEARTBEAT_MS
+} = {}) {
+  const currentMtime = Number(currentMtimeMs)
+  const previousMtime = Number(previousMtimeMs)
+  const hasCurrentMtime = currentMtimeMs !== null && Number.isFinite(currentMtime)
+  const hasPreviousMtime = previousMtimeMs !== null && Number.isFinite(previousMtime)
+  const nextMtimeMs = hasCurrentMtime ? currentMtime : (hasPreviousMtime ? previousMtime : null)
+  const configChanged = hasCurrentMtime && (!hasPreviousMtime || currentMtime !== previousMtime)
+  const elapsedMs = Math.max(0, Number(nowMs) - Math.max(0, Number(lastAttemptAtMs) || 0))
+  const heartbeatDue = elapsedMs >= Math.max(1, Number(heartbeatMs) || CONFIG_SYNC_HEARTBEAT_MS)
+  return {
+    shouldPush: Boolean(autoSync) && (configChanged || heartbeatDue),
+    nextMtimeMs
+  }
+}
 
 export function migrateDashboardPath(currentPath, { legacyExists, canonicalValid }) {
   const current = String(currentPath || '').trim()

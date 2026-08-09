@@ -14,8 +14,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   CANONICAL_DASHBOARD_PATH,
+  CONFIG_SYNC_HEARTBEAT_MS,
   LEGACY_DASHBOARD_PATH,
   migrateDashboardPath,
+  resolveDashboardConfigSync,
   validateRuntimeIdentity,
 } from "./runtime.mjs";
 
@@ -86,6 +88,8 @@ interface DailyConfig {
 export default class ScreenTimeDashboardBridgePlugin extends Plugin {
   settings: BridgeSettings = DEFAULT_SETTINGS;
   private dailyConfigMtimeMs: number | null = null;
+  private lastConfigPushAttemptAtMs = 0;
+  private configPushInFlight = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -227,19 +231,24 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
 
   private async syncDailyConfigWhenChanged(): Promise<void> {
     if (!this.settings.autoSyncConfig) return;
+    let currentMtimeMs: number | null = null;
     try {
       const stats = await fs.stat(this.getDailyConfigPath());
-      const mtime = Number(stats.mtimeMs || 0);
-      if (this.dailyConfigMtimeMs === null) {
-        this.dailyConfigMtimeMs = mtime;
-        return;
-      }
-      if (mtime !== this.dailyConfigMtimeMs) {
-        this.dailyConfigMtimeMs = mtime;
-        await this.pushConfigToDashboard(true);
-      }
+      currentMtimeMs = Number(stats.mtimeMs || 0);
     } catch {
-      // Ignore missing config file and transient errors.
+      currentMtimeMs = null;
+    }
+    const decision = resolveDashboardConfigSync({
+      autoSync: this.settings.autoSyncConfig,
+      currentMtimeMs,
+      previousMtimeMs: this.dailyConfigMtimeMs,
+      lastAttemptAtMs: this.lastConfigPushAttemptAtMs,
+      nowMs: Date.now(),
+      heartbeatMs: CONFIG_SYNC_HEARTBEAT_MS,
+    });
+    this.dailyConfigMtimeMs = decision.nextMtimeMs;
+    if (decision.shouldPush) {
+      await this.pushConfigToDashboard(true);
     }
   }
 
@@ -328,18 +337,29 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     };
   }
 
-  async pushConfigToDashboard(silent = false): Promise<void> {
+  async pushConfigToDashboard(silent = false): Promise<boolean> {
+    if (this.configPushInFlight) return false;
+    this.configPushInFlight = true;
+    this.lastConfigPushAttemptAtMs = Date.now();
     try {
       const payload = await this.buildDashboardConfigPayload();
-      await requestUrl({
+      const response = await requestUrl({
         url: `${BACKEND_URL}/api/obsidian/config`,
         method: "PUT",
         body: JSON.stringify(payload),
         headers: { "Content-Type": "application/json" },
+        throw: false,
       });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`HTTP ${response.status}`);
+      }
       if (!silent) new Notice("ScreenTime Dashboard 配置已同步到后端");
+      return true;
     } catch (err) {
       if (!silent) new Notice(`同步配置失败: ${String(err)}`);
+      return false;
+    } finally {
+      this.configPushInFlight = false;
     }
   }
 

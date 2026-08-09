@@ -6,8 +6,10 @@ import { execFileSync } from 'node:child_process'
 import {
   APP_ID,
   CANONICAL_DASHBOARD_PATH,
+  CONFIG_SYNC_HEARTBEAT_MS,
   LEGACY_DASHBOARD_PATH,
   migrateDashboardPath,
+  resolveDashboardConfigSync,
   validateRuntimeIdentity
 } from '../src/runtime.mjs'
 
@@ -44,6 +46,29 @@ test('runtime validation requires app id, canonical root, and launch mode', () =
   }, expected)
   assert.equal(mismatch.ok, false)
   assert.match(mismatch.message, /实际运行目录/)
+})
+
+test('config sync pushes on change and retries on heartbeat', () => {
+  assert.deepEqual(resolveDashboardConfigSync({
+    currentMtimeMs: 20,
+    previousMtimeMs: 10,
+    lastAttemptAtMs: 9_000,
+    nowMs: 10_000
+  }), { shouldPush: true, nextMtimeMs: 20 })
+
+  assert.deepEqual(resolveDashboardConfigSync({
+    currentMtimeMs: 20,
+    previousMtimeMs: 20,
+    lastAttemptAtMs: 10_000,
+    nowMs: 10_000 + CONFIG_SYNC_HEARTBEAT_MS - 1
+  }), { shouldPush: false, nextMtimeMs: 20 })
+
+  assert.deepEqual(resolveDashboardConfigSync({
+    currentMtimeMs: null,
+    previousMtimeMs: 20,
+    lastAttemptAtMs: 10_000,
+    nowMs: 10_000 + CONFIG_SYNC_HEARTBEAT_MS
+  }), { shouldPush: true, nextMtimeMs: 20 })
 })
 
 test('plugin release files and source declare version 0.1.3', () => {

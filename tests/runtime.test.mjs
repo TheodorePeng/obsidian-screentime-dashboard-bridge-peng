@@ -71,18 +71,18 @@ test('config sync pushes on change and retries on heartbeat', () => {
   }), { shouldPush: true, nextMtimeMs: 20 })
 })
 
-test('plugin release files and source declare version 0.1.3', () => {
+test('plugin release files and source declare version 0.1.4', () => {
   const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   const lockJson = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'))
   const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'))
   const versions = JSON.parse(readFileSync(new URL('../versions.json', import.meta.url), 'utf8'))
   const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 
-  assert.equal(packageJson.version, '0.1.3')
-  assert.equal(lockJson.version, '0.1.3')
-  assert.equal(lockJson.packages[''].version, '0.1.3')
-  assert.equal(manifest.version, '0.1.3')
-  assert.equal(versions['0.1.3'], '1.5.0')
+  assert.equal(packageJson.version, '0.1.4')
+  assert.equal(lockJson.version, '0.1.4')
+  assert.equal(lockJson.packages[''].version, '0.1.4')
+  assert.equal(manifest.version, '0.1.4')
+  assert.equal(versions['0.1.4'], '1.5.0')
   assert.match(source, /\/api\/system\/runtime/)
   assert.match(source, /validateRuntimeIdentity/)
   assert.match(source, /start\.py 与 stop\.py/)

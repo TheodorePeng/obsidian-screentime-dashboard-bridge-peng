@@ -13,6 +13,10 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
+  appendBoundedTail,
+  resolvePythonExecutable,
+} from "./python-runtime.mjs";
+import {
   CANONICAL_DASHBOARD_PATH,
   CONFIG_SYNC_HEARTBEAT_MS,
   LEGACY_DASHBOARD_PATH,
@@ -25,6 +29,7 @@ type StartMode = "dev" | "prod";
 
 interface BridgeSettings {
   dashboardPath: string;
+  pythonExecutable: string;
   startMode: StartMode;
   openBrowserOnStart: boolean;
   autoSyncConfig: boolean;
@@ -33,6 +38,7 @@ interface BridgeSettings {
 
 const DEFAULT_SETTINGS: BridgeSettings = {
   dashboardPath: CANONICAL_DASHBOARD_PATH,
+  pythonExecutable: "",
   startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
@@ -295,17 +301,51 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     await leaf.openFile(file);
   }
 
-  private async runPython(args: string[]): Promise<void> {
-    const cwd = this.settings.dashboardPath;
+  private async runPython({
+    executable,
+    script,
+    args,
+    cwd,
+    stage,
+  }: {
+    executable: string;
+    script: string;
+    args: string[];
+    cwd: string;
+    stage: string;
+  }): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-      const proc = spawn("python3", args, {
+      let stdout: Buffer = Buffer.alloc(0);
+      let stderr: Buffer = Buffer.alloc(0);
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve();
+      };
+      const proc = spawn(executable, [script, ...args], {
         cwd,
-        stdio: "ignore",
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
       });
-      proc.on("error", reject);
-      proc.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`python3 exited with code ${code}`));
+      proc.stdout?.on("data", (chunk) => {
+        stdout = appendBoundedTail(stdout, chunk);
+      });
+      proc.stderr?.on("data", (chunk) => {
+        stderr = appendBoundedTail(stderr, chunk);
+      });
+      proc.on("error", (error) => {
+        finish(new Error(`${stage}失败：无法启动 ${executable}（${String(error)}）`));
+      });
+      proc.on("close", (code, signal) => {
+        if (code === 0) {
+          finish();
+          return;
+        }
+        const status = code === null ? `signal ${signal || "unknown"}` : `exit ${code}`;
+        const detail = (stderr.length ? stderr : stdout).toString("utf8").trim().replace(/\s+/g, " ");
+        finish(new Error(`${stage}失败：${executable} ${status}${detail ? `：${detail}` : ""}`));
       });
     });
   }
@@ -367,7 +407,17 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     try {
       const expectedRoot = await this.requireDashboardProject();
       const startScript = path.join(expectedRoot, "start.py");
-      await this.runPython([startScript, "--mode", this.settings.startMode, "--no-browser"]);
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable,
+      });
+      await this.runPython({
+        executable: python.executable,
+        script: startScript,
+        args: ["--mode", this.settings.startMode, "--no-browser"],
+        cwd: expectedRoot,
+        stage: "启动 Dashboard",
+      });
       const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 30000);
       if (this.settings.startMode === "dev") {
@@ -400,8 +450,19 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
 
   async stopDashboard(): Promise<void> {
     try {
-      const stopScript = path.join(this.settings.dashboardPath, "stop.py");
-      await this.runPython([stopScript]);
+      const expectedRoot = await this.requireDashboardProject();
+      const stopScript = path.join(expectedRoot, "stop.py");
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable,
+      });
+      await this.runPython({
+        executable: python.executable,
+        script: stopScript,
+        args: [],
+        cwd: expectedRoot,
+        stage: "停止 Dashboard",
+      });
       new Notice("ScreenTime Dashboard 已停止");
     } catch (err) {
       new Notice(`停止失败: ${String(err)}`);
@@ -430,6 +491,19 @@ class BridgeSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.dashboardPath)
           .onChange(async (value) => {
             this.plugin.settings.dashboardPath = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Python 解释器路径")
+      .setDesc("留空时自动探测 Python 3.11+；手动覆盖时仅接受绝对路径（支持开头的 ~/）。")
+      .addText((text) =>
+        text
+          .setPlaceholder("留空自动探测")
+          .setValue(this.plugin.settings.pythonExecutable)
+          .onChange(async (value) => {
+            this.plugin.settings.pythonExecutable = value.trim();
             await this.plugin.saveSettings();
           }),
       );

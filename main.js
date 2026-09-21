@@ -34,12 +34,154 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
-var import_node_child_process = require("node:child_process");
+var import_node_child_process2 = require("node:child_process");
 var import_node_fs = require("node:fs");
-var import_node_path2 = __toESM(require("node:path"), 1);
+var import_node_path3 = __toESM(require("node:path"), 1);
+
+// src/python-runtime.mjs
+var import_node_child_process = require("node:child_process");
+var import_node_os = __toESM(require("node:os"), 1);
+var import_node_path = __toESM(require("node:path"), 1);
+var PYTHON_PROBE_TIMEOUT_MS = 5e3;
+var OUTPUT_TAIL_BYTES = 8 * 1024;
+function appendBoundedTail(current, chunk, maxBytes = OUTPUT_TAIL_BYTES) {
+  const previous = Buffer.isBuffer(current) ? current : Buffer.from(current || "");
+  const addition = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk || "");
+  const combined = Buffer.concat([previous, addition]);
+  return combined.length <= maxBytes ? combined : combined.subarray(combined.length - maxBytes);
+}
+function expandLeadingHome(value, homeDir) {
+  if (value === "~") return homeDir;
+  if (value.startsWith("~/")) return import_node_path.default.join(homeDir, value.slice(2));
+  return value;
+}
+function buildPythonCandidates({
+  dashboardPath,
+  homeDir = import_node_os.default.homedir(),
+  envPath = process.env.PATH || ""
+}) {
+  const fixedCandidates = [
+    import_node_path.default.join(dashboardPath, "backend", ".venv", "bin", "python"),
+    "/opt/homebrew/bin/python3.11",
+    "/opt/homebrew/opt/python@3.11/bin/python3.11",
+    "/usr/local/bin/python3.11",
+    "/usr/local/opt/python@3.11/bin/python3.11",
+    "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
+    import_node_path.default.join(homeDir, ".local", "bin", "python3.11"),
+    import_node_path.default.join(homeDir, ".pyenv", "shims", "python3.11")
+  ];
+  const pathDirs = String(envPath).split(import_node_path.default.delimiter).filter(Boolean);
+  const pathCandidates = [
+    ...pathDirs.map((dir) => import_node_path.default.join(dir, "python3.11")),
+    ...pathDirs.map((dir) => import_node_path.default.join(dir, "python3"))
+  ];
+  return [.../* @__PURE__ */ new Set([...fixedCandidates, ...pathCandidates])];
+}
+function isSupportedPythonVersion(version) {
+  const match = String(version || "").trim().match(/^(\d+)\.(\d+)(?:\.(\d+))?$/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major === 3 && minor >= 11;
+}
+function summarizeOutput(buffer) {
+  const text = Buffer.from(buffer || "").toString("utf8").trim().replace(/\s+/g, " ");
+  if (!text) return "";
+  return text.length <= 512 ? text : text.slice(-512);
+}
+async function probePythonExecutable(executable, { spawnImpl = import_node_child_process.spawn, timeoutMs = PYTHON_PROBE_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    let timedOut = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawnImpl(
+        executable,
+        ["-c", 'import sys; print("%d.%d.%d" % sys.version_info[:3])'],
+        { shell: false, stdio: ["ignore", "pipe", "pipe"] }
+      );
+    } catch (error) {
+      resolve({ ok: false, reason: String(error) });
+      return;
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill();
+      } catch {
+      }
+      finish({ ok: false, reason: `\u63A2\u6D4B\u8D85\u65F6\uFF08${timeoutMs}ms\uFF09` });
+    }, timeoutMs);
+    child.stdout?.on("data", (chunk) => {
+      stdout = appendBoundedTail(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = appendBoundedTail(stderr, chunk);
+    });
+    child.on("error", (error) => {
+      finish({ ok: false, reason: String(error) });
+    });
+    child.on("close", (code, signal) => {
+      if (timedOut) return;
+      const output = summarizeOutput(stdout) || summarizeOutput(stderr);
+      if (code !== 0) {
+        const status = code === null ? `signal ${signal || "unknown"}` : `exit ${code}`;
+        finish({ ok: false, reason: output ? `${status}: ${output}` : status });
+        return;
+      }
+      if (!isSupportedPythonVersion(output)) {
+        finish({ ok: false, reason: output ? `\u4E0D\u652F\u6301\u7684 Python \u7248\u672C ${output}` : "\u65E0\u6CD5\u8BFB\u53D6 Python \u7248\u672C" });
+        return;
+      }
+      finish({ ok: true, version: output });
+    });
+  });
+}
+async function resolvePythonExecutable({
+  dashboardPath,
+  configuredPath = "",
+  homeDir = import_node_os.default.homedir(),
+  envPath = process.env.PATH || "",
+  probe = probePythonExecutable
+}) {
+  const configured = String(configuredPath || "").trim();
+  if (configured) {
+    const executable = expandLeadingHome(configured, homeDir);
+    if (!import_node_path.default.isAbsolute(executable)) {
+      throw new Error("\u914D\u7F6E\u7684 Python \u89E3\u91CA\u5668\u5FC5\u987B\u662F\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u4EC5\u652F\u6301\u5F00\u5934\u7684 ~/ \u5C55\u5F00\uFF09");
+    }
+    const result = await probe(executable);
+    if (result.ok && isSupportedPythonVersion(result.version)) {
+      return { executable, version: result.version, source: "configured" };
+    }
+    const reason = result.reason || `\u4E0D\u652F\u6301\u7684 Python \u7248\u672C ${result.version || "unknown"}`;
+    throw new Error(`\u914D\u7F6E\u7684 Python \u89E3\u91CA\u5668\u4E0D\u53EF\u7528\uFF1A${executable}\uFF08${reason}\uFF09`);
+  }
+  const attempts = [];
+  for (const executable of buildPythonCandidates({ dashboardPath, homeDir, envPath })) {
+    const result = await probe(executable);
+    if (result.ok && isSupportedPythonVersion(result.version)) {
+      return { executable, version: result.version, source: "automatic" };
+    }
+    attempts.push({
+      executable,
+      reason: result.reason || `\u4E0D\u652F\u6301\u7684 Python \u7248\u672C ${result.version || "unknown"}`
+    });
+  }
+  const detail = attempts.map(({ executable, reason }) => `${executable}: ${reason}`).join("; ");
+  throw new Error(`\u672A\u627E\u5230\u53EF\u7528\u7684 Python 3.11+\u3002\u5DF2\u5C1D\u8BD5\uFF1A${detail}`);
+}
 
 // src/runtime.mjs
-var import_node_path = __toESM(require("node:path"), 1);
+var import_node_path2 = __toESM(require("node:path"), 1);
 var APP_ID = "peng.screentime-dashboard";
 var CANONICAL_DASHBOARD_PATH = "/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard";
 var LEGACY_DASHBOARD_PATH = "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard";
@@ -76,8 +218,8 @@ function validateRuntimeIdentity(runtime, expected) {
   if (!runtime || runtime.app_id !== APP_ID) {
     return { ok: false, message: "\u5F53\u524D\u7AEF\u53E3\u4E0D\u662F ScreenTime Dashboard\uFF0C\u5DF2\u62D2\u7EDD\u6253\u5F00\u6D4F\u89C8\u5668\u3002" };
   }
-  const expectedRoot = import_node_path.default.resolve(String(expected?.path || ""));
-  const actualRoot = import_node_path.default.resolve(String(runtime.project_root || ""));
+  const expectedRoot = import_node_path2.default.resolve(String(expected?.path || ""));
+  const actualRoot = import_node_path2.default.resolve(String(runtime.project_root || ""));
   if (!expectedRoot || actualRoot !== expectedRoot) {
     return {
       ok: false,
@@ -98,6 +240,7 @@ function validateRuntimeIdentity(runtime, expected) {
 // src/main.ts
 var DEFAULT_SETTINGS = {
   dashboardPath: CANONICAL_DASHBOARD_PATH,
+  pythonExecutable: "",
   startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
@@ -235,8 +378,8 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     if (!root) return false;
     return (await Promise.all([
       this.pathExists(root),
-      this.pathExists(import_node_path2.default.join(root, "start.py")),
-      this.pathExists(import_node_path2.default.join(root, "stop.py"))
+      this.pathExists(import_node_path3.default.join(root, "start.py")),
+      this.pathExists(import_node_path3.default.join(root, "stop.py"))
     ])).every(Boolean);
   }
   async requireDashboardProject() {
@@ -248,7 +391,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async readDailyConfig() {
     const basePath = this.getVaultBasePath();
-    const configPath = import_node_path2.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
+    const configPath = import_node_path3.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
     try {
       const raw = await import_node_fs.promises.readFile(configPath, "utf-8");
       const json = JSON.parse(raw);
@@ -263,7 +406,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   getDailyConfigPath() {
     const basePath = this.getVaultBasePath();
-    return import_node_path2.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
+    return import_node_path3.default.join(basePath, this.app.vault.configDir, "daily-notes.json");
   }
   async syncDailyConfigWhenChanged() {
     if (!this.settings.autoSyncConfig) return;
@@ -326,17 +469,45 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     const leaf = this.app.workspace.getLeaf(true);
     await leaf.openFile(file);
   }
-  async runPython(args) {
-    const cwd = this.settings.dashboardPath;
+  async runPython({
+    executable,
+    script,
+    args,
+    cwd,
+    stage
+  }) {
     await new Promise((resolve, reject) => {
-      const proc = (0, import_node_child_process.spawn)("python3", args, {
+      let stdout = Buffer.alloc(0);
+      let stderr = Buffer.alloc(0);
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve();
+      };
+      const proc = (0, import_node_child_process2.spawn)(executable, [script, ...args], {
         cwd,
-        stdio: "ignore"
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"]
       });
-      proc.on("error", reject);
-      proc.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`python3 exited with code ${code}`));
+      proc.stdout?.on("data", (chunk) => {
+        stdout = appendBoundedTail(stdout, chunk);
+      });
+      proc.stderr?.on("data", (chunk) => {
+        stderr = appendBoundedTail(stderr, chunk);
+      });
+      proc.on("error", (error) => {
+        finish(new Error(`${stage}\u5931\u8D25\uFF1A\u65E0\u6CD5\u542F\u52A8 ${executable}\uFF08${String(error)}\uFF09`));
+      });
+      proc.on("close", (code, signal) => {
+        if (code === 0) {
+          finish();
+          return;
+        }
+        const status = code === null ? `signal ${signal || "unknown"}` : `exit ${code}`;
+        const detail = (stderr.length ? stderr : stdout).toString("utf8").trim().replace(/\s+/g, " ");
+        finish(new Error(`${stage}\u5931\u8D25\uFF1A${executable} ${status}${detail ? `\uFF1A${detail}` : ""}`));
       });
     });
   }
@@ -392,8 +563,18 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   async startDashboard() {
     try {
       const expectedRoot = await this.requireDashboardProject();
-      const startScript = import_node_path2.default.join(expectedRoot, "start.py");
-      await this.runPython([startScript, "--mode", this.settings.startMode, "--no-browser"]);
+      const startScript = import_node_path3.default.join(expectedRoot, "start.py");
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable
+      });
+      await this.runPython({
+        executable: python.executable,
+        script: startScript,
+        args: ["--mode", this.settings.startMode, "--no-browser"],
+        cwd: expectedRoot,
+        stage: "\u542F\u52A8 Dashboard"
+      });
       const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 3e4);
       if (this.settings.startMode === "dev") {
@@ -425,8 +606,19 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   }
   async stopDashboard() {
     try {
-      const stopScript = import_node_path2.default.join(this.settings.dashboardPath, "stop.py");
-      await this.runPython([stopScript]);
+      const expectedRoot = await this.requireDashboardProject();
+      const stopScript = import_node_path3.default.join(expectedRoot, "stop.py");
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable
+      });
+      await this.runPython({
+        executable: python.executable,
+        script: stopScript,
+        args: [],
+        cwd: expectedRoot,
+        stage: "\u505C\u6B62 Dashboard"
+      });
       new import_obsidian.Notice("ScreenTime Dashboard \u5DF2\u505C\u6B62");
     } catch (err) {
       new import_obsidian.Notice(`\u505C\u6B62\u5931\u8D25: ${String(err)}`);
@@ -444,6 +636,12 @@ var BridgeSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Dashboard \u9879\u76EE\u8DEF\u5F84").setDesc("start.py \u4E0E stop.py \u6240\u5728\u76EE\u5F55").addText(
       (text) => text.setPlaceholder(CANONICAL_DASHBOARD_PATH).setValue(this.plugin.settings.dashboardPath).onChange(async (value) => {
         this.plugin.settings.dashboardPath = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Python \u89E3\u91CA\u5668\u8DEF\u5F84").setDesc("\u7559\u7A7A\u65F6\u81EA\u52A8\u63A2\u6D4B Python 3.11+\uFF1B\u624B\u52A8\u8986\u76D6\u65F6\u4EC5\u63A5\u53D7\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u652F\u6301\u5F00\u5934\u7684 ~/\uFF09\u3002").addText(
+      (text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u63A2\u6D4B").setValue(this.plugin.settings.pythonExecutable).onChange(async (value) => {
+        this.plugin.settings.pythonExecutable = value.trim();
         await this.plugin.saveSettings();
       })
     );

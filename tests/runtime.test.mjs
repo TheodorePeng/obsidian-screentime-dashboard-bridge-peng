@@ -5,8 +5,9 @@ import { readFileSync, statSync } from 'node:fs'
 import {
   APP_ID,
   CANONICAL_DASHBOARD_PATH,
-  CONFIG_SYNC_HEARTBEAT_MS,
+  CONFIG_SYNC_RETRY_DELAYS_MS,
   LEGACY_DASHBOARD_PATH,
+  buildStableSignature,
   migrateDashboardPath,
   resolveDashboardConfigSync,
   validateRuntimeIdentity
@@ -207,10 +208,13 @@ test('runtime validation requires app id, canonical root, and launch mode', () =
   assert.match(mismatch.message, /实际运行目录/)
 })
 
-test('config sync pushes on change and retries on heartbeat', () => {
+test('config sync pushes changes once and stops after success', () => {
   assert.deepEqual(resolveDashboardConfigSync({
     currentMtimeMs: 20,
     previousMtimeMs: 10,
+    currentSignature: 'new',
+    lastSuccessfulSignature: 'old',
+    failedAttempts: 0,
     lastAttemptAtMs: 9_000,
     nowMs: 10_000
   }), { shouldPush: true, nextMtimeMs: 20 })
@@ -218,30 +222,57 @@ test('config sync pushes on change and retries on heartbeat', () => {
   assert.deepEqual(resolveDashboardConfigSync({
     currentMtimeMs: 20,
     previousMtimeMs: 20,
+    currentSignature: 'same',
+    lastSuccessfulSignature: 'same',
+    failedAttempts: 0,
     lastAttemptAtMs: 10_000,
-    nowMs: 10_000 + CONFIG_SYNC_HEARTBEAT_MS - 1
+    nowMs: 10_000 + 24 * 60 * 60 * 1000
+  }), { shouldPush: false, nextMtimeMs: 20 })
+})
+
+test('config sync retries failures with bounded exponential backoff', () => {
+  assert.deepEqual(resolveDashboardConfigSync({
+    currentMtimeMs: null,
+    previousMtimeMs: 20,
+    currentSignature: 'new',
+    lastSuccessfulSignature: 'old',
+    failedAttempts: 1,
+    lastAttemptAtMs: 10_000,
+    nowMs: 10_000 + CONFIG_SYNC_RETRY_DELAYS_MS[0] - 1
   }), { shouldPush: false, nextMtimeMs: 20 })
 
   assert.deepEqual(resolveDashboardConfigSync({
     currentMtimeMs: null,
     previousMtimeMs: 20,
+    currentSignature: 'new',
+    lastSuccessfulSignature: 'old',
+    failedAttempts: 1,
     lastAttemptAtMs: 10_000,
-    nowMs: 10_000 + CONFIG_SYNC_HEARTBEAT_MS
+    nowMs: 10_000 + CONFIG_SYNC_RETRY_DELAYS_MS[0]
   }), { shouldPush: true, nextMtimeMs: 20 })
+
+  assert.equal(CONFIG_SYNC_RETRY_DELAYS_MS.at(-1), 300_000)
 })
 
-test('plugin release files and source declare version 0.1.5', () => {
+test('stable config signatures ignore object key insertion order', () => {
+  assert.equal(
+    buildStableSignature({ timezone: 'Asia/Shanghai', daily_folder: 'Daily' }),
+    buildStableSignature({ daily_folder: 'Daily', timezone: 'Asia/Shanghai' })
+  )
+})
+
+test('plugin release files and source declare version 0.1.6', () => {
   const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   const lockJson = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'))
   const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'))
   const versions = JSON.parse(readFileSync(new URL('../versions.json', import.meta.url), 'utf8'))
   const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 
-  assert.equal(packageJson.version, '0.1.5')
-  assert.equal(lockJson.version, '0.1.5')
-  assert.equal(lockJson.packages[''].version, '0.1.5')
-  assert.equal(manifest.version, '0.1.5')
-  assert.equal(versions['0.1.5'], '1.5.0')
+  assert.equal(packageJson.version, '0.1.6')
+  assert.equal(lockJson.version, '0.1.6')
+  assert.equal(lockJson.packages[''].version, '0.1.6')
+  assert.equal(manifest.version, '0.1.6')
+  assert.equal(versions['0.1.6'], '1.5.0')
   assert.match(source, /\/api\/system\/runtime/)
   assert.match(source, /validateRuntimeIdentity/)
   assert.match(source, /start\.py 与 stop\.py/)
@@ -257,8 +288,26 @@ test('plugin source resolves an explicit Python executable for start and stop', 
   assert.doesNotMatch(source, /stdio: "ignore"/)
 })
 
+test('plugin exposes fixed production, explicit development, and diagnostic commands', () => {
+  const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
+  assert.match(source, /id: "start-dashboard"[\s\S]*startDashboard\("prod"\)/)
+  assert.match(source, /id: "start-dashboard-dev"[\s\S]*startDashboard\("dev"\)/)
+  assert.match(source, /id: "diagnose-dashboard"[\s\S]*diagnoseDashboard\(\)/)
+  assert.match(source, /doctor\.py/)
+  assert.match(source, /extends Modal/)
+  assert.doesNotMatch(source, /setName\("启动模式"\)/)
+})
+
 test('local BRAT-required assets exist and are nonempty without network access', () => {
   for (const asset of ['main.js', 'manifest.json', 'styles.css']) {
     assert.ok(statSync(new URL(`../${asset}`, import.meta.url)).size > 0, `${asset} should be nonempty`)
   }
+})
+
+test('local deployment script preserves data.json and verifies deployed hashes', () => {
+  const source = readFileSync(new URL('../scripts/deploy-local.mjs', import.meta.url), 'utf8')
+  assert.match(source, /main\.js.*manifest\.json.*styles\.css/s)
+  assert.match(source, /sha256/)
+  assert.match(source, /plugin:reload/)
+  assert.doesNotMatch(source, /copyFile\([^\n]*data\.json/)
 })

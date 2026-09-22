@@ -1,6 +1,7 @@
 import {
   App,
   FileSystemAdapter,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -18,8 +19,8 @@ import {
 } from "./python-runtime.mjs";
 import {
   CANONICAL_DASHBOARD_PATH,
-  CONFIG_SYNC_HEARTBEAT_MS,
   LEGACY_DASHBOARD_PATH,
+  buildStableSignature,
   migrateDashboardPath,
   resolveDashboardConfigSync,
   validateRuntimeIdentity,
@@ -30,7 +31,6 @@ type StartMode = "dev" | "prod";
 interface BridgeSettings {
   dashboardPath: string;
   pythonExecutable: string;
-  startMode: StartMode;
   openBrowserOnStart: boolean;
   autoSyncConfig: boolean;
   screenTimeHeading: string;
@@ -39,7 +39,6 @@ interface BridgeSettings {
 const DEFAULT_SETTINGS: BridgeSettings = {
   dashboardPath: CANONICAL_DASHBOARD_PATH,
   pythonExecutable: "",
-  startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
   screenTimeHeading: "ScreenTime",
@@ -95,6 +94,8 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
   settings: BridgeSettings = DEFAULT_SETTINGS;
   private dailyConfigMtimeMs: number | null = null;
   private lastConfigPushAttemptAtMs = 0;
+  private lastSuccessfulConfigSignature = "";
+  private configSyncFailureCount = 0;
   private configPushInFlight = false;
 
   async onload(): Promise<void> {
@@ -106,7 +107,23 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
       id: "start-dashboard",
       name: "Start ScreenTime Dashboard",
       callback: async () => {
-        await this.startDashboard();
+        await this.startDashboard("prod");
+      },
+    });
+
+    this.addCommand({
+      id: "start-dashboard-dev",
+      name: "Start ScreenTime Dashboard (Development)",
+      callback: async () => {
+        await this.startDashboard("dev");
+      },
+    });
+
+    this.addCommand({
+      id: "diagnose-dashboard",
+      name: "Diagnose ScreenTime Dashboard",
+      callback: async () => {
+        await this.diagnoseDashboard();
       },
     });
 
@@ -137,7 +154,7 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(async () => {
       if (this.settings.autoSyncConfig) {
-        await this.pushConfigToDashboard(true);
+        await this.pushConfigToDashboard(true, true);
       }
     });
 
@@ -175,7 +192,7 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
     if (this.settings.autoSyncConfig) {
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, true);
     }
   }
 
@@ -244,17 +261,21 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     } catch {
       currentMtimeMs = null;
     }
+    const payload = await this.buildDashboardConfigPayload();
+    const currentSignature = buildStableSignature(payload);
     const decision = resolveDashboardConfigSync({
       autoSync: this.settings.autoSyncConfig,
       currentMtimeMs,
       previousMtimeMs: this.dailyConfigMtimeMs,
+      currentSignature,
+      lastSuccessfulSignature: this.lastSuccessfulConfigSignature,
+      failedAttempts: this.configSyncFailureCount,
       lastAttemptAtMs: this.lastConfigPushAttemptAtMs,
       nowMs: Date.now(),
-      heartbeatMs: CONFIG_SYNC_HEARTBEAT_MS,
     });
     this.dailyConfigMtimeMs = decision.nextMtimeMs;
     if (decision.shouldPush) {
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, false, payload);
     }
   }
 
@@ -307,22 +328,27 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     args,
     cwd,
     stage,
+    allowNonZero = false,
   }: {
     executable: string;
     script: string;
     args: string[];
     cwd: string;
     stage: string;
-  }): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+    allowNonZero?: boolean;
+  }): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
       let stdout: Buffer = Buffer.alloc(0);
       let stderr: Buffer = Buffer.alloc(0);
       let settled = false;
-      const finish = (error?: Error) => {
+      const finish = (
+        result?: { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string },
+        error?: Error,
+      ) => {
         if (settled) return;
         settled = true;
         if (error) reject(error);
-        else resolve();
+        else if (result) resolve(result);
       };
       const proc = spawn(executable, [script, ...args], {
         cwd,
@@ -336,16 +362,22 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
         stderr = appendBoundedTail(stderr, chunk);
       });
       proc.on("error", (error) => {
-        finish(new Error(`${stage}失败：无法启动 ${executable}（${String(error)}）`));
+        finish(undefined, new Error(`${stage}失败：无法启动 ${executable}（${String(error)}）`));
       });
       proc.on("close", (code, signal) => {
-        if (code === 0) {
-          finish();
+        const result = {
+          code,
+          signal,
+          stdout: stdout.toString("utf8").trim(),
+          stderr: stderr.toString("utf8").trim(),
+        };
+        if (code === 0 || allowNonZero) {
+          finish(result);
           return;
         }
         const status = code === null ? `signal ${signal || "unknown"}` : `exit ${code}`;
         const detail = (stderr.length ? stderr : stdout).toString("utf8").trim().replace(/\s+/g, " ");
-        finish(new Error(`${stage}失败：${executable} ${status}${detail ? `：${detail}` : ""}`));
+        finish(undefined, new Error(`${stage}失败：${executable} ${status}${detail ? `：${detail}` : ""}`));
       });
     });
   }
@@ -377,12 +409,16 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     };
   }
 
-  async pushConfigToDashboard(silent = false): Promise<boolean> {
+  async pushConfigToDashboard(
+    silent = false,
+    force = false,
+    preparedPayload?: Record<string, string>,
+  ): Promise<boolean> {
     if (this.configPushInFlight) return false;
     this.configPushInFlight = true;
     this.lastConfigPushAttemptAtMs = Date.now();
     try {
-      const payload = await this.buildDashboardConfigPayload();
+      const payload = preparedPayload || await this.buildDashboardConfigPayload();
       const response = await requestUrl({
         url: `${BACKEND_URL}/api/obsidian/config`,
         method: "PUT",
@@ -393,9 +429,12 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`HTTP ${response.status}`);
       }
+      this.lastSuccessfulConfigSignature = buildStableSignature(payload);
+      this.configSyncFailureCount = 0;
       if (!silent) new Notice("ScreenTime Dashboard 配置已同步到后端");
       return true;
     } catch (err) {
+      this.configSyncFailureCount += 1;
       if (!silent) new Notice(`同步配置失败: ${String(err)}`);
       return false;
     } finally {
@@ -403,7 +442,7 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     }
   }
 
-  async startDashboard(): Promise<void> {
+  async startDashboard(mode: StartMode): Promise<void> {
     try {
       const expectedRoot = await this.requireDashboardProject();
       const startScript = path.join(expectedRoot, "start.py");
@@ -414,13 +453,13 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
       await this.runPython({
         executable: python.executable,
         script: startScript,
-        args: ["--mode", this.settings.startMode, "--no-browser"],
+        args: ["--mode", mode, "--no-browser"],
         cwd: expectedRoot,
         stage: "启动 Dashboard",
       });
-      const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
+      const openUrl = mode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 30000);
-      if (this.settings.startMode === "dev") {
+      if (mode === "dev") {
         await this.waitHttpReady(FRONTEND_URL_DEV, 30000);
       }
       const runtimeResponse = await requestUrl({
@@ -433,16 +472,16 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
       }
       const runtimeValidation = validateRuntimeIdentity(runtimeResponse.json, {
         path: expectedRoot,
-        mode: this.settings.startMode,
+        mode,
       });
       if (!runtimeValidation.ok) {
         throw new Error(runtimeValidation.message);
       }
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, true);
       if (this.settings.openBrowserOnStart) {
         window.open(openUrl, "_blank");
       }
-      new Notice(`ScreenTime Dashboard 已启动: ${openUrl}`);
+      new Notice(`ScreenTime Dashboard 已启动（${mode}）: ${openUrl}`);
     } catch (err) {
       new Notice(`启动失败: ${String(err)}`);
     }
@@ -467,6 +506,78 @@ export default class ScreenTimeDashboardBridgePlugin extends Plugin {
     } catch (err) {
       new Notice(`停止失败: ${String(err)}`);
     }
+  }
+
+  async diagnoseDashboard(): Promise<void> {
+    try {
+      const expectedRoot = await this.requireDashboardProject();
+      const doctorScript = path.join(expectedRoot, "scripts", "doctor.py");
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable,
+      });
+      const result = await this.runPython({
+        executable: python.executable,
+        script: doctorScript,
+        args: ["--json"],
+        cwd: expectedRoot,
+        stage: "诊断 Dashboard",
+        allowNonZero: true,
+      });
+      const report = JSON.parse(result.stdout) as DashboardDoctorReport;
+      new DashboardDiagnosticModal(this.app, report, python.executable).open();
+    } catch (err) {
+      new Notice(`诊断失败: ${String(err)}`);
+    }
+  }
+}
+
+interface DoctorCheck {
+  id: string;
+  status: "pass" | "fail" | "warning";
+  summary: string;
+}
+
+interface DashboardDoctorReport {
+  ok: boolean;
+  required_checks: DoctorCheck[];
+  optional_checks: DoctorCheck[];
+  hints?: string[];
+}
+
+class DashboardDiagnosticModal extends Modal {
+  constructor(
+    app: App,
+    private readonly report: DashboardDoctorReport,
+    private readonly pythonExecutable: string,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `ScreenTime Dashboard 诊断：${this.report.ok ? "通过" : "需要处理"}` });
+    contentEl.createEl("p", { text: `Python: ${this.pythonExecutable}` });
+    for (const [title, checks] of [
+      ["必检项目", this.report.required_checks || []],
+      ["可选项目", this.report.optional_checks || []],
+    ] as const) {
+      contentEl.createEl("h3", { text: title });
+      const list = contentEl.createEl("ul");
+      for (const check of checks) {
+        list.createEl("li", { text: `${check.status === "pass" ? "✓" : "⚠"} ${check.id}: ${check.summary}` });
+      }
+    }
+    if (this.report.hints?.length) {
+      contentEl.createEl("h3", { text: "建议" });
+      const hints = contentEl.createEl("ul");
+      for (const hint of this.report.hints) hints.createEl("li", { text: hint });
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 
@@ -504,20 +615,6 @@ class BridgeSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.pythonExecutable)
           .onChange(async (value) => {
             this.plugin.settings.pythonExecutable = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("启动模式")
-      .setDesc("dev: 前后端分离（5173）；prod: 后端托管前端（8000）")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("dev", "dev")
-          .addOption("prod", "prod")
-          .setValue(this.plugin.settings.startMode)
-          .onChange(async (value) => {
-            this.plugin.settings.startMode = value === "prod" ? "prod" : "dev";
             await this.plugin.saveSettings();
           }),
       );

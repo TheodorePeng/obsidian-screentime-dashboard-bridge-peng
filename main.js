@@ -185,14 +185,26 @@ var import_node_path2 = __toESM(require("node:path"), 1);
 var APP_ID = "peng.screentime-dashboard";
 var CANONICAL_DASHBOARD_PATH = "/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard";
 var LEGACY_DASHBOARD_PATH = "/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard";
-var CONFIG_SYNC_HEARTBEAT_MS = 15e3;
+var CONFIG_SYNC_RETRY_DELAYS_MS = Object.freeze([15e3, 3e4, 6e4, 3e5]);
+function buildStableSignature(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => buildStableSignature(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${buildStableSignature(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
 function resolveDashboardConfigSync({
   autoSync = true,
   currentMtimeMs = null,
   previousMtimeMs = null,
+  currentSignature = "",
+  lastSuccessfulSignature = "",
+  failedAttempts = 0,
   lastAttemptAtMs = 0,
   nowMs = Date.now(),
-  heartbeatMs = CONFIG_SYNC_HEARTBEAT_MS
+  force = false
 } = {}) {
   const currentMtime = Number(currentMtimeMs);
   const previousMtime = Number(previousMtimeMs);
@@ -201,9 +213,12 @@ function resolveDashboardConfigSync({
   const nextMtimeMs = hasCurrentMtime ? currentMtime : hasPreviousMtime ? previousMtime : null;
   const configChanged = hasCurrentMtime && (!hasPreviousMtime || currentMtime !== previousMtime);
   const elapsedMs = Math.max(0, Number(nowMs) - Math.max(0, Number(lastAttemptAtMs) || 0));
-  const heartbeatDue = elapsedMs >= Math.max(1, Number(heartbeatMs) || CONFIG_SYNC_HEARTBEAT_MS);
+  const failures = Math.max(0, Number(failedAttempts) || 0);
+  const retryIndex = Math.min(Math.max(0, failures - 1), CONFIG_SYNC_RETRY_DELAYS_MS.length - 1);
+  const retryDue = failures === 0 || elapsedMs >= CONFIG_SYNC_RETRY_DELAYS_MS[retryIndex];
+  const signatureChanged = String(currentSignature) !== String(lastSuccessfulSignature);
   return {
-    shouldPush: Boolean(autoSync) && (configChanged || heartbeatDue),
+    shouldPush: Boolean(autoSync) && Boolean(force || configChanged || signatureChanged) && retryDue,
     nextMtimeMs
   };
 }
@@ -241,7 +256,6 @@ function validateRuntimeIdentity(runtime, expected) {
 var DEFAULT_SETTINGS = {
   dashboardPath: CANONICAL_DASHBOARD_PATH,
   pythonExecutable: "",
-  startMode: "dev",
   openBrowserOnStart: true,
   autoSyncConfig: true,
   screenTimeHeading: "ScreenTime"
@@ -287,6 +301,8 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     this.settings = DEFAULT_SETTINGS;
     this.dailyConfigMtimeMs = null;
     this.lastConfigPushAttemptAtMs = 0;
+    this.lastSuccessfulConfigSignature = "";
+    this.configSyncFailureCount = 0;
     this.configPushInFlight = false;
   }
   async onload() {
@@ -296,7 +312,21 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       id: "start-dashboard",
       name: "Start ScreenTime Dashboard",
       callback: async () => {
-        await this.startDashboard();
+        await this.startDashboard("prod");
+      }
+    });
+    this.addCommand({
+      id: "start-dashboard-dev",
+      name: "Start ScreenTime Dashboard (Development)",
+      callback: async () => {
+        await this.startDashboard("dev");
+      }
+    });
+    this.addCommand({
+      id: "diagnose-dashboard",
+      name: "Diagnose ScreenTime Dashboard",
+      callback: async () => {
+        await this.diagnoseDashboard();
       }
     });
     this.addCommand({
@@ -321,7 +351,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     });
     this.app.workspace.onLayoutReady(async () => {
       if (this.settings.autoSyncConfig) {
-        await this.pushConfigToDashboard(true);
+        await this.pushConfigToDashboard(true, true);
       }
     });
     this.registerInterval(
@@ -355,7 +385,7 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     if (this.settings.autoSyncConfig) {
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, true);
     }
   }
   getVaultBasePath() {
@@ -417,17 +447,21 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     } catch {
       currentMtimeMs = null;
     }
+    const payload = await this.buildDashboardConfigPayload();
+    const currentSignature = buildStableSignature(payload);
     const decision = resolveDashboardConfigSync({
       autoSync: this.settings.autoSyncConfig,
       currentMtimeMs,
       previousMtimeMs: this.dailyConfigMtimeMs,
+      currentSignature,
+      lastSuccessfulSignature: this.lastSuccessfulConfigSignature,
+      failedAttempts: this.configSyncFailureCount,
       lastAttemptAtMs: this.lastConfigPushAttemptAtMs,
-      nowMs: Date.now(),
-      heartbeatMs: CONFIG_SYNC_HEARTBEAT_MS
+      nowMs: Date.now()
     });
     this.dailyConfigMtimeMs = decision.nextMtimeMs;
     if (decision.shouldPush) {
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, false, payload);
     }
   }
   async ensureFolderExists(folderPath) {
@@ -474,17 +508,18 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
     script,
     args,
     cwd,
-    stage
+    stage,
+    allowNonZero = false
   }) {
-    await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let stdout = Buffer.alloc(0);
       let stderr = Buffer.alloc(0);
       let settled = false;
-      const finish = (error) => {
+      const finish = (result, error) => {
         if (settled) return;
         settled = true;
         if (error) reject(error);
-        else resolve();
+        else if (result) resolve(result);
       };
       const proc = (0, import_node_child_process2.spawn)(executable, [script, ...args], {
         cwd,
@@ -498,16 +533,22 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
         stderr = appendBoundedTail(stderr, chunk);
       });
       proc.on("error", (error) => {
-        finish(new Error(`${stage}\u5931\u8D25\uFF1A\u65E0\u6CD5\u542F\u52A8 ${executable}\uFF08${String(error)}\uFF09`));
+        finish(void 0, new Error(`${stage}\u5931\u8D25\uFF1A\u65E0\u6CD5\u542F\u52A8 ${executable}\uFF08${String(error)}\uFF09`));
       });
       proc.on("close", (code, signal) => {
-        if (code === 0) {
-          finish();
+        const result = {
+          code,
+          signal,
+          stdout: stdout.toString("utf8").trim(),
+          stderr: stderr.toString("utf8").trim()
+        };
+        if (code === 0 || allowNonZero) {
+          finish(result);
           return;
         }
         const status = code === null ? `signal ${signal || "unknown"}` : `exit ${code}`;
         const detail = (stderr.length ? stderr : stdout).toString("utf8").trim().replace(/\s+/g, " ");
-        finish(new Error(`${stage}\u5931\u8D25\uFF1A${executable} ${status}${detail ? `\uFF1A${detail}` : ""}`));
+        finish(void 0, new Error(`${stage}\u5931\u8D25\uFF1A${executable} ${status}${detail ? `\uFF1A${detail}` : ""}`));
       });
     });
   }
@@ -535,12 +576,12 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       screen_time_heading: this.settings.screenTimeHeading || "ScreenTime"
     };
   }
-  async pushConfigToDashboard(silent = false) {
+  async pushConfigToDashboard(silent = false, force = false, preparedPayload) {
     if (this.configPushInFlight) return false;
     this.configPushInFlight = true;
     this.lastConfigPushAttemptAtMs = Date.now();
     try {
-      const payload = await this.buildDashboardConfigPayload();
+      const payload = preparedPayload || await this.buildDashboardConfigPayload();
       const response = await (0, import_obsidian.requestUrl)({
         url: `${BACKEND_URL}/api/obsidian/config`,
         method: "PUT",
@@ -551,16 +592,19 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`HTTP ${response.status}`);
       }
+      this.lastSuccessfulConfigSignature = buildStableSignature(payload);
+      this.configSyncFailureCount = 0;
       if (!silent) new import_obsidian.Notice("ScreenTime Dashboard \u914D\u7F6E\u5DF2\u540C\u6B65\u5230\u540E\u7AEF");
       return true;
     } catch (err) {
+      this.configSyncFailureCount += 1;
       if (!silent) new import_obsidian.Notice(`\u540C\u6B65\u914D\u7F6E\u5931\u8D25: ${String(err)}`);
       return false;
     } finally {
       this.configPushInFlight = false;
     }
   }
-  async startDashboard() {
+  async startDashboard(mode) {
     try {
       const expectedRoot = await this.requireDashboardProject();
       const startScript = import_node_path3.default.join(expectedRoot, "start.py");
@@ -571,13 +615,13 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       await this.runPython({
         executable: python.executable,
         script: startScript,
-        args: ["--mode", this.settings.startMode, "--no-browser"],
+        args: ["--mode", mode, "--no-browser"],
         cwd: expectedRoot,
         stage: "\u542F\u52A8 Dashboard"
       });
-      const openUrl = this.settings.startMode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
+      const openUrl = mode === "dev" ? FRONTEND_URL_DEV : BACKEND_URL;
       await this.waitHttpReady(`${BACKEND_URL}/api/settings`, 3e4);
-      if (this.settings.startMode === "dev") {
+      if (mode === "dev") {
         await this.waitHttpReady(FRONTEND_URL_DEV, 3e4);
       }
       const runtimeResponse = await (0, import_obsidian.requestUrl)({
@@ -590,16 +634,16 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       }
       const runtimeValidation = validateRuntimeIdentity(runtimeResponse.json, {
         path: expectedRoot,
-        mode: this.settings.startMode
+        mode
       });
       if (!runtimeValidation.ok) {
         throw new Error(runtimeValidation.message);
       }
-      await this.pushConfigToDashboard(true);
+      await this.pushConfigToDashboard(true, true);
       if (this.settings.openBrowserOnStart) {
         window.open(openUrl, "_blank");
       }
-      new import_obsidian.Notice(`ScreenTime Dashboard \u5DF2\u542F\u52A8: ${openUrl}`);
+      new import_obsidian.Notice(`ScreenTime Dashboard \u5DF2\u542F\u52A8\uFF08${mode}\uFF09: ${openUrl}`);
     } catch (err) {
       new import_obsidian.Notice(`\u542F\u52A8\u5931\u8D25: ${String(err)}`);
     }
@@ -624,6 +668,59 @@ var ScreenTimeDashboardBridgePlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(`\u505C\u6B62\u5931\u8D25: ${String(err)}`);
     }
   }
+  async diagnoseDashboard() {
+    try {
+      const expectedRoot = await this.requireDashboardProject();
+      const doctorScript = import_node_path3.default.join(expectedRoot, "scripts", "doctor.py");
+      const python = await resolvePythonExecutable({
+        dashboardPath: expectedRoot,
+        configuredPath: this.settings.pythonExecutable
+      });
+      const result = await this.runPython({
+        executable: python.executable,
+        script: doctorScript,
+        args: ["--json"],
+        cwd: expectedRoot,
+        stage: "\u8BCA\u65AD Dashboard",
+        allowNonZero: true
+      });
+      const report = JSON.parse(result.stdout);
+      new DashboardDiagnosticModal(this.app, report, python.executable).open();
+    } catch (err) {
+      new import_obsidian.Notice(`\u8BCA\u65AD\u5931\u8D25: ${String(err)}`);
+    }
+  }
+};
+var DashboardDiagnosticModal = class extends import_obsidian.Modal {
+  constructor(app, report, pythonExecutable) {
+    super(app);
+    this.report = report;
+    this.pythonExecutable = pythonExecutable;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `ScreenTime Dashboard \u8BCA\u65AD\uFF1A${this.report.ok ? "\u901A\u8FC7" : "\u9700\u8981\u5904\u7406"}` });
+    contentEl.createEl("p", { text: `Python: ${this.pythonExecutable}` });
+    for (const [title, checks] of [
+      ["\u5FC5\u68C0\u9879\u76EE", this.report.required_checks || []],
+      ["\u53EF\u9009\u9879\u76EE", this.report.optional_checks || []]
+    ]) {
+      contentEl.createEl("h3", { text: title });
+      const list = contentEl.createEl("ul");
+      for (const check of checks) {
+        list.createEl("li", { text: `${check.status === "pass" ? "\u2713" : "\u26A0"} ${check.id}: ${check.summary}` });
+      }
+    }
+    if (this.report.hints?.length) {
+      contentEl.createEl("h3", { text: "\u5EFA\u8BAE" });
+      const hints = contentEl.createEl("ul");
+      for (const hint of this.report.hints) hints.createEl("li", { text: hint });
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
 };
 var BridgeSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
@@ -642,12 +739,6 @@ var BridgeSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Python \u89E3\u91CA\u5668\u8DEF\u5F84").setDesc("\u7559\u7A7A\u65F6\u81EA\u52A8\u63A2\u6D4B Python 3.11+\uFF1B\u624B\u52A8\u8986\u76D6\u65F6\u4EC5\u63A5\u53D7\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u652F\u6301\u5F00\u5934\u7684 ~/\uFF09\u3002").addText(
       (text) => text.setPlaceholder("\u7559\u7A7A\u81EA\u52A8\u63A2\u6D4B").setValue(this.plugin.settings.pythonExecutable).onChange(async (value) => {
         this.plugin.settings.pythonExecutable = value.trim();
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("\u542F\u52A8\u6A21\u5F0F").setDesc("dev: \u524D\u540E\u7AEF\u5206\u79BB\uFF085173\uFF09\uFF1Bprod: \u540E\u7AEF\u6258\u7BA1\u524D\u7AEF\uFF088000\uFF09").addDropdown(
-      (dropdown) => dropdown.addOption("dev", "dev").addOption("prod", "prod").setValue(this.plugin.settings.startMode).onChange(async (value) => {
-        this.plugin.settings.startMode = value === "prod" ? "prod" : "dev";
         await this.plugin.saveSettings();
       })
     );

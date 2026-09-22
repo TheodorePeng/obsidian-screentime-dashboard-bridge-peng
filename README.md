@@ -3,7 +3,9 @@
 This plugin bridges Obsidian Daily Notes and the local ScreenTime Dashboard project.
 
 ## Core features
-- Start/stop Dashboard (`start.py` / `stop.py`) from Obsidian commands.
+- Start the production Dashboard on port 8000 from the regular command or existing Advanced URI.
+- Start development mode explicitly with `Start ScreenTime Dashboard (Development)`; only this command starts Vite on port 5173.
+- Stop or diagnose Dashboard from Obsidian commands. Diagnostics are read-only and treat Calendar/Xcode as optional.
 - Open Daily Note by date via protocol:
   `obsidian://screen-time-dashboard-bridge/open-daily?date=YYYY-MM-DD`
 - Push vault Daily Note config to Dashboard backend:
@@ -27,13 +29,14 @@ This generates `main.js` required by Obsidian.
 - Canonical Dashboard path: `/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard`.
 - Version 0.1.3 migrates the retired path only when that path is missing and the canonical checkout contains both `start.py` and `stop.py`.
 - A valid custom path is never overwritten.
-- Version 0.1.5 resolves and probes an absolute Python 3.11+ executable before running `start.py` or `stop.py`. It prefers the project virtual environment, then common Homebrew/Python installations, and only then candidates from Obsidian's `PATH`.
+- Version 0.1.6 resolves and probes an absolute Python 3.11+ executable before production, development, stop, or diagnosis commands. It prefers `backend/.venv`, then common Homebrew/Python installations, and only then candidates from Obsidian's `PATH`.
 - The optional Python interpreter setting is an advanced override. Leave it blank for automatic detection; a non-empty value must be an absolute path (a leading `~/` is supported) and fails closed when invalid.
 - Dashboard launch does not depend on Terminal shell initialization or the Xcode-backed `/usr/bin/python3` being usable.
 - After launch, the plugin checks `GET /api/system/runtime`. It opens the browser only when the app id, real project path, and launch mode match the configured checkout.
 - If another program owns ports 8000/5173, the Dashboard refuses to terminate that unknown process.
+- Daily Note configuration is synchronized after plugin load, after a successful Dashboard start, and when its payload changes. Failed requests retry with bounded backoff; successful unchanged payloads are not sent every 15 seconds.
 
-For local deployment, copy `main.js`, `manifest.json`, and `styles.css` into the Vault plugin directory and keep its `data.json` unchanged. Reload the plugin in Obsidian after copying.
+For local deployment, use `npm run deploy:local` or copy `main.js`, `manifest.json`, and `styles.css` into the Vault plugin directory. The deployment boundary never creates or overwrites `data.json`; reload the plugin in Obsidian after copying.
 
 The regular test suite validates local BRAT assets without network access. Checking assets attached to a published GitHub Release is a separate post-release verification step.
 

@@ -3,15 +3,28 @@ import path from 'node:path'
 export const APP_ID = 'peng.screentime-dashboard'
 export const CANONICAL_DASHBOARD_PATH = '/Users/peng/Documents/GitHub-Peng/ScreenTimeDashboard'
 export const LEGACY_DASHBOARD_PATH = '/Users/peng/Documents/GitHub/PengCode/iPhoneScreenTimeDashboard'
-export const CONFIG_SYNC_HEARTBEAT_MS = 15_000
+export const CONFIG_SYNC_RETRY_DELAYS_MS = Object.freeze([15_000, 30_000, 60_000, 300_000])
+
+export function buildStableSignature(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => buildStableSignature(item)).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${buildStableSignature(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
 
 export function resolveDashboardConfigSync({
   autoSync = true,
   currentMtimeMs = null,
   previousMtimeMs = null,
+  currentSignature = '',
+  lastSuccessfulSignature = '',
+  failedAttempts = 0,
   lastAttemptAtMs = 0,
   nowMs = Date.now(),
-  heartbeatMs = CONFIG_SYNC_HEARTBEAT_MS
+  force = false
 } = {}) {
   const currentMtime = Number(currentMtimeMs)
   const previousMtime = Number(previousMtimeMs)
@@ -20,9 +33,12 @@ export function resolveDashboardConfigSync({
   const nextMtimeMs = hasCurrentMtime ? currentMtime : (hasPreviousMtime ? previousMtime : null)
   const configChanged = hasCurrentMtime && (!hasPreviousMtime || currentMtime !== previousMtime)
   const elapsedMs = Math.max(0, Number(nowMs) - Math.max(0, Number(lastAttemptAtMs) || 0))
-  const heartbeatDue = elapsedMs >= Math.max(1, Number(heartbeatMs) || CONFIG_SYNC_HEARTBEAT_MS)
+  const failures = Math.max(0, Number(failedAttempts) || 0)
+  const retryIndex = Math.min(Math.max(0, failures - 1), CONFIG_SYNC_RETRY_DELAYS_MS.length - 1)
+  const retryDue = failures === 0 || elapsedMs >= CONFIG_SYNC_RETRY_DELAYS_MS[retryIndex]
+  const signatureChanged = String(currentSignature) !== String(lastSuccessfulSignature)
   return {
-    shouldPush: Boolean(autoSync) && (configChanged || heartbeatDue),
+    shouldPush: Boolean(autoSync) && Boolean(force || configChanged || signatureChanged) && retryDue,
     nextMtimeMs
   }
 }
